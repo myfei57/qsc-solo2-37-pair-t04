@@ -6,7 +6,7 @@ from typing import Any
 
 from ..core.clock import Clock
 from ..core.config import ControlConfig, require_within
-from ..errors import RangeError, StateError
+from ..errors import NotFoundError, RangeError, StateError
 from ..persistence.audit import AuditLedger
 from ..persistence.journal import RecordJournal
 from ..persistence.store import DurableStore
@@ -83,23 +83,34 @@ class AsepticTank:
         return self._pressure_kpa
 
     def sterilize(self, *, confirmation_id: str, reason: str) -> dict[str, Any]:
-        """Accept a confirmation; a superseded one is refused here."""
+        """Accept a confirmation this line currently holds; anything else is refused."""
 
-        if not str(confirmation_id).startswith("cfm-"):
-            raise ValidationError("a sterilization reference is required", tank="aseptic")
+        reference = str(confirmation_id)
+        try:
+            confirmation = self.warranties.require_confirmation(
+                reference,
+                scope="sensors",
+                subject="sterilization",
+            )
+        except NotFoundError as exc:
+            raise StateError(
+                "no sterilization confirmation issued on this line matches that reference",
+                tank="aseptic",
+                supplied=reference,
+            ) from exc
         self._sterile = True
         self.gates.open(
             gate_names.ASEPTIC_STERILE,
             reason=str(reason),
-            evidence=str(confirmation_id),
+            evidence=confirmation.confirmation_id,
         )
         record = self.events.append(
             "aseptic-sterilize",
-            {"confirmation_id": str(confirmation_id), "reason": str(reason)},
+            {"confirmation_id": confirmation.confirmation_id, "reason": str(reason)},
         )
         entry = {
             "action": "sterilize",
-            "confirmation_id": str(confirmation_id),
+            "confirmation_id": confirmation.confirmation_id,
             "record_id": record.record_id,
             "reason": str(reason),
             "timestamp": self.clock.timestamp(),
@@ -107,7 +118,7 @@ class AsepticTank:
         self._history.append(entry)
         self.persist()
         self.audit.record("aseptic-sterilize", "aseptic", confirmation.confirmation_id, cause=None)
-        return {"confirmation_id": str(confirmation_id), "event": entry}
+        return {"confirmation_id": confirmation.confirmation_id, "event": entry}
 
     def fill(self, volume_litres: float, *, reason: str, key: str | None = None) -> dict[str, Any]:
         self.gates.require_open(gate_names.ASEPTIC_STERILE, action="aseptic-fill")
@@ -151,9 +162,8 @@ class AsepticTank:
     def pressurize(self, value_kpa: float, *, reason: str) -> dict[str, Any]:
         value = require_within(value_kpa, 0.0, 150.0, field_name="pressure_kpa", scope="pressure")
         self._pressure_kpa = value
-        reference = self._pressure_history[0] if self._pressure_history else value
         self._pressure_history.append(value)
-        in_spec = self.config.pressure.aseptic_in_spec(reference)
+        in_spec = self.config.pressure.aseptic_in_spec(value)
         if in_spec:
             latch = self.latches.clear(
                 latch_names.ASEPTIC_PRESSURE,
